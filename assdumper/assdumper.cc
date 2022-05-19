@@ -171,11 +171,37 @@ public:
     return base * 300 + ext;
   }/*}}}*/
 
+  // PTS (Presentation Time Stamp) is a 33 bit value that
+  // ranges across 5 bytes.
+  //
+  // +--------+--------+--------+--------+--------+
+  // |....BBB.|BBBBBBBB|BBBBBBB.|BBBBBBBB|BBBBBBB.|
+  // +--------+--------+--------+--------+--------+
+  //
+  //  * "B" is 33-bit time based on a 90kHz clock.
+  //  * "." is a reserved bit.
+  uint64_t parse_pts(const unsigned char *buf)/*{{{*/
+  {
+    uint64_t b0 = (buf[0] >> 1) & 0x07;
+    uint64_t b1 = buf[1];
+    uint64_t b2 = buf[2] >> 1;
+    uint64_t b3 = buf[3];
+    uint64_t b4 = buf[4] >> 1;
+    return (b0 << 30) | (b1 << 22) | (b2 << 15) | (b3 << 7) | b4;
+  }/*}}}*/
+
   void dump_caption(const unsigned char *payload)/*{{{*/
   {
     unsigned PES_header_data_length = payload[8];
     unsigned PES_data_packet_header_length = payload[11 + PES_header_data_length] & 0x0F;
     const unsigned char *p = payload + 12 + PES_header_data_length + PES_data_packet_header_length;
+
+    // The highest bit indicates the existence of PTS (which means
+    // "Please show this caption at this time!"), so it's slightly
+    // more accurate than using the last PCR.
+    if (payload[7] >> 7) {
+        curts = system_clock::clock(parse_pts(payload + 9) * 300);
+    }
 
     // B24 Table 9-1 (p184)
     unsigned data_group_id = (*p & 0xFC)>>2;
