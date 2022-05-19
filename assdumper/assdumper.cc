@@ -16,8 +16,6 @@
 static std::vector<int> extract_pmt_pids(const unsigned char *payload);
 static int extract_caption_pid(const unsigned char *payload);
 static int extract_pcr_pid(const unsigned char *payload);
-static time_t extract_jst_time(const unsigned char *payload);
-static unsigned decode_bcd(uint8_t n);
 static std::string try_gaiji(int c);
 static void print_prelude();
 static bool blank_p(const std::string& str);
@@ -63,7 +61,7 @@ class AssDumper
   bool prelude_printed;
   bool prev_blank;
 
-  system_clock prevts, curts;
+  uint64_t prevts, curts, t0;
   std::string prevsub;
 public:
   AssDumper(const char *path)/*{{{*/
@@ -88,6 +86,7 @@ public:
     std::vector<int> pmt_pids;
     int caption_pid = -1;
     int pcr_pid = -1;
+    bool seeding = true;
 
     while (fread(buf, 1, 188, fin) == 188) {
       // ISO Table 2-2
@@ -105,9 +104,14 @@ public:
         const unsigned adaptation_field_length = *p;
         ++p;
         const bool pcr_flag = !!(p[0] & 0x10);
+        if (pcr_flag && seeding) {
+            // Use the first PCR detected as t0.
+            t0 = parse_pcr(p+1);
+            seeding = false;
+        }
         if (pcr_flag && pid == pcr_pid) {
           // ISO 2.4.2.2
-          curts = system_clock::clock(parse_pcr(p+1));
+          curts = parse_pcr(p+1);
         }
         p += adaptation_field_length;
       }
@@ -124,19 +128,11 @@ public:
         } else if (caption_pid == -1 && find(pmt_pids.begin(), pmt_pids.end(), pid) != pmt_pids.end()) {
           // PMT section
           if (payload_unit_start_indicator) {
-            const int r = extract_pcr_pid(p+1);
+            pcr_pid = extract_pcr_pid(p+1);
             caption_pid = extract_caption_pid(p+1);
             if (caption_pid != -1) {
-              pcr_pid = r;
               fprintf(stderr, "%d caption pid, PCR_PID = %d\n", caption_pid, pcr_pid);
             }
-          }
-        } else if (pid == 0x0014) {
-          // Time Offset Table
-          // B10-2 5.2.9
-          const time_t t = extract_jst_time(p+1);
-          if (t != 0) {
-            clock_offset = t*100 - curts.centitime();
           }
         } else if (pid == caption_pid) {
           if (payload_unit_start_indicator) {
@@ -190,6 +186,14 @@ public:
     return (b0 << 30) | (b1 << 22) | (b2 << 15) | (b3 << 7) | b4;
   }/*}}}*/
 
+  uint64_t delta(uint64_t t0, uint64_t t1)/*{{{*/
+  {
+    if (t1 < t0) {
+        t1 += 0x3ffffffffff;
+    }
+    return t1 - t0;
+  }/*}}}*/
+
   void dump_caption(const unsigned char *payload)/*{{{*/
   {
     unsigned PES_header_data_length = payload[8];
@@ -200,7 +204,7 @@ public:
     // "Please show this caption at this time!"), so it's slightly
     // more accurate than using the last PCR.
     if (payload[7] >> 7) {
-        curts = system_clock::clock(parse_pts(payload + 9) * 300);
+        curts = parse_pts(payload + 9) * 300;
     }
 
     // B24 Table 9-1 (p184)
@@ -222,22 +226,16 @@ public:
       unsigned data_unit_size = (q[5]<<16) | (q[6]<<8) | q[7];
       if (data_unit_parameter == 0x20) {
         if (!prevsub.empty() && !(blank_p(prevsub) && prev_blank)) {
-          const unsigned long long prev_time_centi = prevts.centitime() + clock_offset;
-          const unsigned long long cur_time_centi = curts.centitime() + clock_offset;
-          const time_t prev_time = prev_time_centi/100;
-          const time_t cur_time = cur_time_centi/100;
-          const unsigned prev_centi = prev_time_centi%100;
-          const unsigned cur_centi = cur_time_centi%100;
-          struct tm prev, cur;
-          localtime_r(&prev_time, &prev);
-          localtime_r(&cur_time, &cur);
           if (!prelude_printed) {
             print_prelude();
             prelude_printed = true;
           }
+
+          system_clock prev = system_clock::clock(delta(t0, prevts));
+          system_clock cur = system_clock::clock(delta(t0, curts));
           printf("Dialogue: 0,%02u:%02u:%02u.%02u,%02u:%02u:%02u.%02u,Default,,,,,,%s\n",
-              prev.tm_hour, prev.tm_min, prev.tm_sec, prev_centi,
-              cur.tm_hour, cur.tm_min, cur.tm_sec, cur_centi,
+              prev.hour(), prev.minute(), prev.second(), prev.centisecond(),
+              cur.hour(), cur.minute(), cur.second(), cur.centisecond(),
               prevsub.c_str());
         }
         prev_blank = blank_p(prevsub);
@@ -379,32 +377,6 @@ int extract_caption_pid(const unsigned char *payload)/*{{{*/
 int extract_pcr_pid(const unsigned char *payload)/*{{{*/
 {
   return ((payload[8]&0x1f)<<8) | payload[9];
-}/*}}}*/
-
-time_t extract_jst_time(const unsigned char *payload)/*{{{*/
-{
-  if (payload[0] != 0x73) {
-    //throw "this is not a Time Offset Table";
-    return 0;
-  }
-  struct tm t;
-  // B10-2 Appendix C
-  uint16_t MJD = (payload[3]<<8) | payload[4];
-  unsigned y = (MJD - 15078.2)/365.25;
-  unsigned m = (MJD - 14956.1 - unsigned(y * 365.25))/30.6001;
-  unsigned k = m == 14 || m == 15;
-  t.tm_year = y + k;
-  t.tm_mon = m - 2 - k*12;
-  t.tm_mday = MJD - 14956 - unsigned(y * 365.25) - unsigned(m * 30.6001);
-  t.tm_hour = decode_bcd(payload[5]);
-  t.tm_min = decode_bcd(payload[6]);
-  t.tm_sec = decode_bcd(payload[7]);
-  return mktime(&t);
-}/*}}}*/
-
-unsigned decode_bcd(uint8_t n)/*{{{*/
-{
-  return (n>>4)*10 + (n&0x0f);
 }/*}}}*/
 
 void print_prelude()/*{{{*/
