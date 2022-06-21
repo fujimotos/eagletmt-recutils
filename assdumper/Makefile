@@ -1,11 +1,15 @@
 CXX = g++
 CXXFLAGS = -O2 -Wall -W
 LDFLAGS =
-OBJS = assdumper.o
-TARGET = assdumper
+TARGET = assdumper tsvdumper
 
-$(TARGET): $(OBJS)
-	$(CXX) $(LDFLAGS) $< -o $@
+all: $(TARGET)
+
+%: %.cc
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $< -o $@
 
 clean:
-	$(RM) $(OBJS) $(TARGET)
+	$(RM) $(TARGET)
+
+.PHONY: all clean
+
