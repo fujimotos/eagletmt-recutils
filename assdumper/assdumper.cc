@@ -860,8 +860,6 @@ std::string try_gaiji(int c)/*{{{*/
     case 0x764A: return "麴";
     case 0x764B: return "麵";
     default:
-      char buf[16];
-      sprintf(buf, "{gaiji 0x%x}", c);
-      return buf;
+      return "";  /* Ignore unknown char */
   }
 }/*}}}*/
